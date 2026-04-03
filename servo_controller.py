@@ -87,14 +87,15 @@ MOVEMENT_PROFILES = {
 JOINTS: dict[str, dict] = {}
 
 # Torque defaults per servo (applied on startup)
+# ST3215 range: 0–1000  (1000 ≈ 100 % of stall torque)
 DEFAULT_TORQUES = {
-    200: 150,   # Neck
-    201: 100,   # Left Ear
-    202: 100,   # Right Ear
-    101: 200,   # Left Front Leg
-    102: 200,   # Right Front Leg
-    103: 200,   # Left Back Leg
-    104: 200,   # Right Back Leg
+    200: 300,   # Neck
+    201: 500,   # Left Ear
+    202: 500,   # Right Ear
+    101: 400,   # Left Front Leg
+    102: 400,   # Right Front Leg
+    103: 400,   # Left Back Leg
+    104: 400,   # Right Back Leg
 }
 
 
@@ -191,7 +192,11 @@ class ServoHardware:
         if self.simulate:
             return
         with self._lock:
-            self.packet_handler.WriteTorqueEx(servo_id, torque)
+            # SDK WriteTorqueEx is buggy (uses loword/hiword instead of
+            # lobyte/hibyte), so write the 2-byte torque limit directly.
+            ph = self.packet_handler
+            txpacket = [ph.scs_lobyte(torque), ph.scs_hibyte(torque)]
+            ph.writeTxRx(servo_id, 48, len(txpacket), txpacket)  # 48 = SMS_STS_TORQUE_LIMIT
 
     def move(self, servo_id: int, position: int, speed: int, acc: int) -> None:
         """Send a position/speed/acc command to one servo."""
@@ -209,6 +214,35 @@ class ServoHardware:
                     "WritePosEx ID:%d comm error: %s",
                     servo_id,
                     self.packet_handler.getTxRxResult(comm),
+                )
+
+    def move_timed(self, servo_id: int, position: int, time_ms: int, acc: int) -> None:
+        """Send a position command with Goal Time instead of Goal Speed.
+
+        The servo computes the required speed internally to arrive at
+        *position* in *time_ms* milliseconds.  Goal Speed is set to 0.
+        """
+        if self.simulate:
+            log.debug(
+                "SIM move_timed ID:%d pos:%d time:%dms acc:%d",
+                servo_id, position, time_ms, acc,
+            )
+            return
+        with self._lock:
+            ph = self.packet_handler
+            txpacket = [
+                acc,
+                ph.scs_lobyte(position), ph.scs_hibyte(position),
+                ph.scs_lobyte(time_ms),  ph.scs_hibyte(time_ms),
+                0, 0,  # Goal Speed = 0  →  servo uses Goal Time
+            ]
+            comm, err = ph.writeTxRx(
+                servo_id, 41, len(txpacket), txpacket   # 41 = SMS_STS_ACC
+            )
+            if comm != COMM_SUCCESS:
+                log.warning(
+                    "move_timed ID:%d comm error: %s",
+                    servo_id, ph.getTxRxResult(comm),
                 )
 
     def read_position(self, servo_id: int) -> int | None:
@@ -339,57 +373,40 @@ def handle_joint_animate(msg: dict, hw: ServoHardware) -> dict:
         degrees_to_raw(target_deg, joint["zero_position"]), joint
     )
 
-    # Determine current position to compute distance
-    current_raw = hw.read_position(joint["id"])
-    if current_raw is None:
-        # If we can't read, assume the joint is at its zero position
-        current_raw = joint["zero_position"]
-
-    distance_steps = abs(target_raw - current_raw)
-    if distance_steps == 0:
-        # Already at target
-        return {
-            "type": "joint_animate_response",
-            "joint_name": joint_name,
-            "status": "already_at_target",
-            "target_degrees": target_deg,
-            "target_raw": target_raw,
-            "computed_speed": 0,
-            "acc": 0,
-            "movement_type": movement_type,
-        }
-
     profile = MOVEMENT_PROFILES[movement_type]
-
-    # Base speed = distance / time  (in steps/sec)
-    base_speed = distance_steps / duration
-
-    # Multiply by the profile factor to compensate for time spent
-    # accelerating/decelerating (higher ACC → more ramp time → need
-    # higher peak speed to finish on schedule).
-    servo_speed = max(1, int(base_speed * profile["speed_mult"]))
     acc = profile["acc"]
+    time_ms = max(1, int(duration * 1000))
 
-    hw.move(joint["id"], target_raw, servo_speed, acc)
+    # Optional per-command torque override (0–1000). Applied before move,
+    # reverts to the joint's default torque afterwards.
+    torque = msg.get("torque")
+    if torque is not None:
+        torque = max(0, min(1000, int(torque)))
+        hw.enable_torque(joint["id"], torque)
+
+    hw.move_timed(joint["id"], target_raw, time_ms, acc)
 
     log.info(
-        "ANIMATE %s → %.1f° in %.2fs (raw %d) spd=%d acc=%d [%s]",
-        joint_name, target_deg, duration, target_raw, servo_speed, acc,
+        "ANIMATE %s → %.1f° in %.2fs (raw %d) time=%dms acc=%d torque=%s [%s]",
+        joint_name, target_deg, duration, target_raw, time_ms, acc,
+        torque if torque is not None else "default",
         movement_type,
     )
 
-    return {
+    resp = {
         "type": "joint_animate_response",
         "joint_name": joint_name,
         "status": "ok",
         "target_degrees": target_deg,
         "target_raw": target_raw,
-        "computed_speed": servo_speed,
+        "time_ms": time_ms,
         "acc": acc,
         "movement_type": movement_type,
-        "distance_degrees": round(distance_steps / STEPS_PER_DEGREE, 2),
         "duration": duration,
     }
+    if torque is not None:
+        resp["torque"] = torque
+    return resp
 
 
 def handle_get_status(msg: dict, hw: ServoHardware) -> dict:
