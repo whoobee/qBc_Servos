@@ -1,0 +1,72 @@
+{
+  "description": "qB Companion servo calibration data",
+  "serial": {
+    "port": "/dev/ttyAMA0",
+    "baudrate": 1000000
+  },
+  "servos": {
+    "neck": {
+      "id": 200,
+      "name": "Neck",
+      "zero_position": 1913,
+      "min_degrees": -90,
+      "max_degrees": 90,
+      "min_raw": 889,
+      "max_raw": 2937
+    },
+    "left_ear": {
+      "id": 201,
+      "name": "Left Ear",
+      "zero_position": 1824,
+      "min_degrees": -90,
+      "max_degrees": 90,
+      "min_raw": 800,
+      "max_raw": 2848
+    },
+    "right_ear": {
+      "id": 202,
+      "name": "Right Ear",
+      "zero_position": 2316,
+      "min_degrees": -90,
+      "max_degrees": 90,
+      "min_raw": 1292,
+      "max_raw": 3340
+    },
+    "left_front_leg": {
+      "id": 101,
+      "name": "Left Front Leg",
+      "zero_position": 2048,
+      "min_degrees": -45,
+      "max_degrees": 45,
+      "min_raw": 1536,
+      "max_raw": 2560
+    },
+    "right_front_leg": {
+      "id": 102,
+      "name": "Right Front Leg",
+      "zero_position": 2467,
+      "min_degrees": -45,
+      "max_degrees": 45,
+      "min_raw": 1955,
+      "max_raw": 2979
+    },
+    "left_back_leg": {
+      "id": 103,
+      "name": "Left Back Leg",
+      "zero_position": 2243,
+      "min_degrees": -45,
+      "max_degrees": 45,
+      "min_raw": 1731,
+      "max_raw": 2755
+    },
+    "right_back_leg": {
+      "id": 104,
+      "name": "Right Back Leg",
+      "zero_position": 2131,
+      "min_degrees": -45,
+      "max_degrees": 45,
+      "min_raw": 1619,
+      "max_raw": 2643
+    }
+  }
+}

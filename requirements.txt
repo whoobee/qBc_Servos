@@ -1,0 +1,4 @@
+pyserial==3.5
+keyboard
+textual>=0.75.0
+websockets>=12.0
