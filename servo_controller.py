@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""qB Companion - WebSocket Servo Controller
+"""qB Companion - MQTT Servo Controller
 
-Starts a WebSocket server that accepts JSON commands to move servos.
+Subscribes to robot/joints/cmd for JSON commands to move servos.
 Loads calibration from servo_calibration.json and initialises all joints
 to their calibrated zero positions on startup.
 
 Usage:
-    python servo_controller.py                          # default port 8765
-    python servo_controller.py --ws-port 9000           # custom WS port
-    python servo_controller.py --simulate               # no hardware
+    python servo_controller.py                              # defaults
+    python servo_controller.py --mqtt-broker 192.168.1.10   # remote broker
+    python servo_controller.py --simulate                   # no hardware
     python servo_controller.py --config path/to/cal.json
 
-WebSocket message types (send JSON):
+MQTT topics:
+    Subscribe: robot/joints/cmd
+    Publish:   robot/joints/status
+
+Message types (publish JSON to robot/joints/cmd):
 
 1) joint_move_request
    {"type": "joint_move_request",
@@ -36,15 +40,16 @@ import sys
 import os
 import json
 import math
-import asyncio
 import argparse
 import logging
+import signal
 import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import websockets
+import paho.mqtt.client as mqtt
 
 try:
     from scservo_sdk import *
@@ -66,8 +71,14 @@ STEPS_PER_DEGREE = 4096.0 / 360.0  # ≈ 11.378 steps per degree
 DEFAULT_CENTER = 2048
 DEFAULT_BAUDRATE = 1000000
 DEFAULT_PORT = "/dev/ttyAMA0"
-DEFAULT_WS_PORT = 8765
+DEFAULT_MQTT_BROKER = "localhost"
+DEFAULT_MQTT_PORT = 1883
 DEFAULT_CONFIG = "servo_calibration.json"
+
+# MQTT topics
+TOPIC_JOINTS_CMD = "robot/joints/cmd"
+TOPIC_JOINTS_STATUS = "robot/joints/status"
+TOPIC_HEARTBEAT = "robot/system/heartbeat/servos"
 
 # Movement type → (ACC value, speed multiplier)
 # ACC on ST3215: lower = faster ramp ⇒ more "constant-speed" profile.
@@ -157,7 +168,7 @@ class ServoHardware:
     """Thread-safe wrapper around the scservo_sdk serial bus.
 
     All public methods acquire a lock before touching the bus so that
-    concurrent WebSocket handlers don't corrupt packets.
+    concurrent calls don't corrupt packets.
     """
 
     def __init__(self, port: str, baudrate: int, simulate: bool):
@@ -460,47 +471,61 @@ HANDLERS = {
 }
 
 
-# ─── WebSocket Server ───────────────────────────────────────────────────────
+# ─── MQTT Callbacks ─────────────────────────────────────────────────────────
 
-async def ws_handler(websocket, hw: ServoHardware):
-    remote = websocket.remote_address
-    log.info("Client connected: %s", remote)
+def _on_connect(client, userdata, connect_flags, reason_code, properties):
+    hw = userdata
+    if reason_code.is_failure:
+        log.error("MQTT connection failed: %s", reason_code)
+        return
+    log.info("Connected to MQTT broker")
+    client.subscribe(TOPIC_JOINTS_CMD, qos=1)
+    client.publish(
+        TOPIC_JOINTS_STATUS,
+        json.dumps({"status": "online", "joints": list(JOINTS.keys())}),
+        qos=1, retain=True,
+    )
+
+
+def _on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+    if reason_code.is_failure:
+        log.warning("Disconnected from MQTT broker: %s", reason_code)
+
+
+def _on_message(client, userdata, msg):
+    hw = userdata
     try:
-        async for raw_msg in websocket:
-            try:
-                msg = json.loads(raw_msg)
-            except json.JSONDecodeError as e:
-                await websocket.send(json.dumps(
-                    {"type": "error", "message": f"Invalid JSON: {e}"}
-                ))
-                continue
+        data = json.loads(msg.payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        log.warning("Invalid JSON on %s", msg.topic)
+        return
 
-            msg_type = msg.get("type")
-            handler = HANDLERS.get(msg_type)
-            if handler is None:
-                resp = {
-                    "type": "error",
-                    "message": f"Unknown request type: {msg_type}. "
-                               f"Valid: {list(HANDLERS.keys())}",
-                }
-            else:
-                resp = handler(msg, hw)
+    msg_type = data.get("type")
+    handler = HANDLERS.get(msg_type)
+    if handler is None:
+        log.warning("Unknown request type: %s", msg_type)
+        return
 
-            await websocket.send(json.dumps(resp))
-    except websockets.ConnectionClosed:
-        pass
-    finally:
-        log.info("Client disconnected: %s", remote)
+    try:
+        resp = handler(data, hw)
+    except Exception:
+        log.exception("Handler error for %s", msg_type)
+        return
 
+    # Publish response for status queries and errors
+    if resp.get("type") in ("joint_status", "error"):
+        client.publish(TOPIC_JOINTS_STATUS, json.dumps(resp), qos=0)
+
+
+# ─── Joint Initialisation ───────────────────────────────────────────────────
 
 def initialise_joints(hw: ServoHardware) -> None:
     """Enable torque and move every joint to its calibrated zero position."""
-    log.info("Initialising all joints to zero position…")
+    log.info("Initialising all joints to zero position...")
     for key, joint in JOINTS.items():
         hw.enable_torque(joint["id"], joint["torque"])
 
     # Small delay to let torque enable settle
-    import time
     time.sleep(0.1)
 
     for key, joint in JOINTS.items():
@@ -513,30 +538,60 @@ def initialise_joints(hw: ServoHardware) -> None:
     log.info("All joints sent to zero position")
 
 
-async def main_async(args):
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+def main_run(args):
     hw = ServoHardware(args.port, args.baudrate, args.simulate)
 
     try:
         initialise_joints(hw)
 
-        log.info("Starting WebSocket server on 0.0.0.0:%d", args.ws_port)
+        client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id="qbc_servos",
+            userdata=hw,
+        )
+        client.on_connect = _on_connect
+        client.on_disconnect = _on_disconnect
+        client.on_message = _on_message
+        client.will_set(
+            TOPIC_JOINTS_STATUS,
+            json.dumps({"status": "offline"}),
+            qos=1, retain=True,
+        )
 
-        async with websockets.serve(
-            lambda ws: ws_handler(ws, hw),
-            "0.0.0.0",
-            args.ws_port,
-        ):
-            log.info("Server ready – awaiting connections")
-            await asyncio.Future()  # run forever
-    except KeyboardInterrupt:
-        log.info("Shutting down…")
+        client.connect(args.mqtt_broker, args.mqtt_port)
+        client.loop_start()
+
+        log.info(
+            "Servo controller running — MQTT %s:%d — subscribed to %s",
+            args.mqtt_broker, args.mqtt_port, TOPIC_JOINTS_CMD,
+        )
+
+        # Block until signal, publish heartbeat every second
+        stop = threading.Event()
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+
+        while not stop.is_set():
+            client.publish(TOPIC_HEARTBEAT, b"1", qos=0)
+            stop.wait(1.0)
+
+        log.info("Shutting down...")
+        client.publish(
+            TOPIC_JOINTS_STATUS,
+            json.dumps({"status": "offline"}),
+            qos=1, retain=True,
+        )
+        client.loop_stop()
+        client.disconnect()
     finally:
         hw.close()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="qB Companion – WebSocket Servo Controller"
+        description="qB Companion – MQTT Servo Controller"
     )
     parser.add_argument(
         "--port", default=DEFAULT_PORT,
@@ -547,8 +602,12 @@ def main():
         help=f"Baudrate (default: {DEFAULT_BAUDRATE})",
     )
     parser.add_argument(
-        "--ws-port", type=int, default=DEFAULT_WS_PORT,
-        help=f"WebSocket listen port (default: {DEFAULT_WS_PORT})",
+        "--mqtt-broker", default=DEFAULT_MQTT_BROKER,
+        help=f"MQTT broker address (default: {DEFAULT_MQTT_BROKER})",
+    )
+    parser.add_argument(
+        "--mqtt-port", type=int, default=DEFAULT_MQTT_PORT,
+        help=f"MQTT broker port (default: {DEFAULT_MQTT_PORT})",
     )
     parser.add_argument(
         "--config", default=DEFAULT_CONFIG,
@@ -561,7 +620,7 @@ def main():
     args = parser.parse_args()
 
     load_calibration(args.config)
-    asyncio.run(main_async(args))
+    main_run(args)
 
 
 if __name__ == "__main__":
