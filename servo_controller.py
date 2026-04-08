@@ -79,6 +79,8 @@ DEFAULT_CONFIG = "servo_calibration.json"
 TOPIC_JOINTS_CMD = "robot/joints/cmd"
 TOPIC_JOINTS_STATUS = "robot/joints/status"
 TOPIC_HEARTBEAT = "robot/system/heartbeat/servos"
+TOPIC_CURRENT_STATE = "robot/joints/current_state"
+TOPIC_ERROR_INFO = "robot/joints/error_info"
 
 # Movement type → (ACC value, speed multiplier)
 # ACC on ST3215: lower = faster ramp ⇒ more "constant-speed" profile.
@@ -473,6 +475,10 @@ HANDLERS = {
 
 # ─── MQTT Callbacks ─────────────────────────────────────────────────────────
 
+_servo_current_state = "initializing"
+_servo_error_info = "E_OK"
+
+
 def _on_connect(client, userdata, connect_flags, reason_code, properties):
     hw = userdata
     if reason_code.is_failure:
@@ -485,6 +491,8 @@ def _on_connect(client, userdata, connect_flags, reason_code, properties):
         json.dumps({"status": "online", "joints": list(JOINTS.keys())}),
         qos=1, retain=True,
     )
+    client.publish(TOPIC_CURRENT_STATE, _servo_current_state, qos=1, retain=True)
+    client.publish(TOPIC_ERROR_INFO, _servo_error_info, qos=1, retain=True)
 
 
 def _on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
@@ -508,8 +516,11 @@ def _on_message(client, userdata, msg):
 
     try:
         resp = handler(data, hw)
-    except Exception:
+    except Exception as e:
         log.exception("Handler error for %s", msg_type)
+        global _servo_error_info
+        _servo_error_info = str(e)[:80]
+        client.publish(TOPIC_ERROR_INFO, _servo_error_info, qos=1, retain=True)
         return
 
     # Publish response for status queries and errors
@@ -541,10 +552,13 @@ def initialise_joints(hw: ServoHardware) -> None:
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main_run(args):
+    global _servo_current_state, _servo_error_info
     hw = ServoHardware(args.port, args.baudrate, args.simulate)
 
     try:
+        _servo_current_state = "initializing"
         initialise_joints(hw)
+        _servo_current_state = "ready"
 
         client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
